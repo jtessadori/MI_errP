@@ -1,11 +1,12 @@
 classdef MI_errP
     properties
         fs=512; % WARNING: DO NOT change this. Amplifier acquisition rate can only be changed from its panel in Simulink, it is here for reference
-        MIbufferLength=.4; % WARNING: as above, changing this here DOES NOT modify them in Simulink. Make sure desired lenghts are correct IN BOTH
+        MIbufferLength=.5; % WARNING: as above, changing this here DOES NOT modify them in Simulink. Make sure desired lenghts are correct IN BOTH
         errPbufferLength=5; % Same as above. Parameters can be changed in triggeredBuffer block initialization mask in the Simulink block
         rawData;
         cursorPos;
         targetPos;
+        ETcursorPos;
         condition;
         figureParams;
         colorScheme;
@@ -17,9 +18,11 @@ classdef MI_errP
         recLength
         trainingParams;
         timingParams;
-        learningRate=1e-2;
+        feedbackType; % 1 - no tactile feedback, 2 - tactile feedback
+        learningRate=1e-4;
         nPositions=11; % Please, keep this odd
         vibrationParams;
+        maxNtrials;
         takeStep=@(obj)((rand>obj.trainingParams.errChance)-.5)*2*sign(obj.targetPos-obj.cursorPos);
     end
     properties (Dependent)
@@ -27,13 +30,17 @@ classdef MI_errP
     end
     properties (Hidden)
         CDlength;
-        possibleConditions={'Training','Testing'};
+        possibleConditions={'V feedback','VT feedback'};
         isExpClosed=0;
-        isTraining;
         actualTarget;
         lapFilterCoeffs;
         nextCursorPos;
         lastCursorPos;
+        errPdataWindow;
+        isPausing=0;
+        isSerialPortOpen=0;
+        currPhase=1;
+        isDebugging=1;
     end
     methods
         %% Constructor
@@ -51,38 +58,61 @@ classdef MI_errP
             % settings of relevant Simulink model.
             
             % Set length of initial countdown, in seconds
-            obj.CDlength=15;
+            if obj.isDebugging
+                obj.CDlength=2;
+            else
+                obj.CDlength=15;
+            end
             
-            % Set desired length of recording
-            obj.recLength=1200;
+%             % Set number of exp trials
+%             obj.maxNtrials=1400;
             
             % Define timing parameters
-            obj.timingParams.targetReachedPause=2; % Wait at target position, once reached
-            obj.timingParams.MIestimationLength=4; % Integrate data over this many seconds before drawing conclusion
-            obj.timingParams.MIstepLength=.1; % Distance, in seconds, between evaluations of MI
-            obj.timingParams.errPestimationLength=1; % Length of window used for errP estimation, following movement
-            obj.timingParams.vibrationLength=1; % Length, in seconds, of armband vibration
-            obj.timingParams.interStepInterval=obj.timingParams.MIestimationLength+obj.timingParams.errPestimationLength; % Wait between cursor movements, in seconds
+            if obj.isDebugging
+                obj.timingParams.targetReachedPause=.2; % Wait at target position, once reached
+                obj.timingParams.MIestimationLength=.5; % Integrate data over this many seconds before drawing conclusion
+                obj.timingParams.MIstepLength=.1; % Distance, in seconds, between evaluations of MI
+                obj.timingParams.errPestimationLength=.2; % Length of window used for errP estimation, following movement
+                obj.timingParams.vibrationLength=.1; % Length, in seconds, of armband vibration
+                obj.timingParams.interStepInterval=obj.timingParams.MIestimationLength+obj.timingParams.errPestimationLength+.1; % Wait between cursor movements, in seconds
+                obj.timingParams.phase1Length=180; % After this many seconds, MI classifier is computed and perfect online training starts
+                obj.timingParams.phase2Length=600; % After this many seconds from phase 1 beginning, errP classifier is computed and actual online training starts
+                obj.timingParams.phase3Length=600;
+            else
+                obj.timingParams.targetReachedPause=2; % Wait at target position, once reached
+                obj.timingParams.MIestimationLength=3; % Integrate data over this many seconds before drawing conclusion
+                obj.timingParams.MIstepLength=.1; % Distance, in seconds, between evaluations of MI
+                obj.timingParams.errPestimationLength=1; % Length of window used for errP estimation, following movement
+                obj.timingParams.vibrationLength=1; % Length, in seconds, of armband vibration
+                obj.timingParams.interStepInterval=obj.timingParams.MIestimationLength+obj.timingParams.errPestimationLength+1; % Wait between cursor movements, in seconds
+                obj.timingParams.phase1Length=0; % After this many seconds, MI classifier is computed and perfect online training starts
+                obj.timingParams.phase2Length=600; % After this many seconds from phase 1 beginning, errP classifier is computed and actual online training starts
+                obj.timingParams.phase3Length=300;
+            end
             
             % Define squares positions
             obj.figureParams.squarePos=linspace(-.95,.95,obj.nPositions);
             
             % Define chance of error during training
-            obj.trainingParams.errChance=0.3;
+            if obj.isDebugging
+                obj.trainingParams.errChance=0.1;
+            else
+                obj.trainingParams.errChance=0.3;
+            end
             
             % Set colors for different objects
             obj.colorScheme.bg=[.05,.05,.05];
             % Randomize color setup to reudce expectations
-%             obj.colorScheme.targetColor=[.4,0,.1];
-%             obj.colorScheme.cursorColorMI=[0,.4,0];
-%             obj.colorScheme.cursorColorRest=[.4,.4,.4];
-%             obj.colorScheme.cursorColorReached=[.6,.6,0];
             obj.colorScheme.possibleColors={[.4,0,.1],[0,.4,0],[.8,.2,0],[.6,.6,0]};
-            obj.colorScheme.colorOrder=randperm(length(obj.colorScheme.possibleColors));
-            obj.colorScheme.targetColor=obj.colorScheme.possibleColors{obj.colorScheme.colorOrder(1)};
-            obj.colorScheme.cursorColorMI=obj.colorScheme.possibleColors{obj.colorScheme.colorOrder(2)};
-            obj.colorScheme.cursorColorRest=obj.colorScheme.possibleColors{obj.colorScheme.colorOrder(3)};
-            obj.colorScheme.cursorColorReached=obj.colorScheme.possibleColors{obj.colorScheme.colorOrder(4)};
+            %             obj.colorScheme.colorOrder=randperm(length(obj.colorScheme.possibleColors));
+            %             obj.colorScheme.targetColor=obj.colorScheme.possibleColors{obj.colorScheme.colorOrder(1)};
+            %             obj.colorScheme.cursorColorMI=obj.colorScheme.possibleColors{obj.colorScheme.colorOrder(2)};
+            %             obj.colorScheme.cursorColorRest=obj.colorScheme.possibleColors{obj.colorScheme.colorOrder(3)};
+            %             obj.colorScheme.cursorColorReached=obj.colorScheme.possibleColors{obj.colorScheme.colorOrder(4)};
+            obj.colorScheme.targetColor=obj.colorScheme.possibleColors{1};
+            obj.colorScheme.cursorColorMI=obj.colorScheme.possibleColors{2};
+            obj.colorScheme.cursorColorRest=obj.colorScheme.possibleColors{4};
+            obj.colorScheme.cursorColorReached=obj.colorScheme.possibleColors{3};
             obj.colorScheme.cursorColor=obj.colorScheme.cursorColorMI;
             obj.colorScheme.edgeColor=[.4,.4,.4];
             
@@ -90,10 +120,22 @@ classdef MI_errP
             obj.figureParams.squareShape.X=[-.05,.05,.05,-.05];
             obj.figureParams.squareShape.Y=[-.05,-.05,.05,.05];
             
+            % Set shape for arrows
+            obj.figureParams.leftArrow.X=[-1,-.4,-.4,1,1,-.4,-.4]/20;
+            obj.figureParams.leftArrow.Y=[0,.5,.2,.2,-.2,-.2,-.5]/20;
+            obj.figureParams.rightArrow.X=[-1,.4,.4,1,.4,.4,-1]/20;
+            obj.figureParams.rightArrow.Y=[.2,.2,.5,0,-.5,-.2,-.2]/20;
+            obj.figureParams.headlessArrow.X=[-1,1,1,-1]/20;
+            obj.figureParams.headlessArrow.Y=[.2,.2,-.2,-.2]/20;
+            
+            % Set shape for eye-tracker cursor
+            obj.figureParams.ETcursor.X=[.005,-.005,-.005,.005];
+            obj.figureParams.ETcursor.Y=[.005,.005,-.005,-.005];
+            
             % Define vibration intensities for different events
             obj.vibrationParams.MItrain=.4;
             obj.vibrationParams.feedback=1;
- 
+            
             % Initialize a few things
             obj.outputLog.time=[];
             obj.outputLog.cursorPos=[];
@@ -102,13 +144,20 @@ classdef MI_errP
             obj.outputLog.errPest=[];
             obj.outputLog.MItimes=[];
             obj.outputLog.MIest=[];
+            obj.outputLog.MIprob=[];
             obj.outputLog.targetsReached.time=[];
             obj.outputLog.targetsReached.targetPos=[];
+            obj.outputLog.targetsReached.correctTarget=[];
             obj.outputLog.correctMovement=[];
             obj.outputLog.MIindex=cell(0);
+            obj.outputLog.MItrialMov=[];
             obj.outputLog.MIfeats=[];
             obj.outputLog.MIupdateTime=[];
+            obj.outputLog.MIlbls=[];
             obj.outputLog.paramsHistory=[];
+            obj.outputLog.errPfeats=[];
+            obj.outputLog.correctMov=[];
+            obj.outputLog.actualMov=[];
             
             % Ask user whether to start experiment right away
             clc;
@@ -124,7 +173,7 @@ classdef MI_errP
             assignin('base','isExpClosing',0);
             
             % Sets name of Simulink model to be used for acquisition
-            obj.modelName='SimpleAcquisition_16ch_2014a_MI_errP';
+            obj.modelName='SimpleAcquisition_16ch_2014a_RT_preProc';
             
             % Prompts user to select a condition
             obj=selectCondition(obj);
@@ -134,14 +183,11 @@ classdef MI_errP
             % movement
             obj.targetPos=1+(randn>0)*(obj.nPositions-1);
             obj.cursorPos=(1+obj.nPositions)/2;
-            if obj.isTraining
-                % If training session, decide next position
-                obj.nextCursorPos=min(obj.nPositions,max(1,obj.cursorPos+obj.takeStep(obj)));
-            end
+            obj.nextCursorPos=min(obj.nPositions,max(1,obj.cursorPos+obj.takeStep(obj)));
             
             % Prepares serial port for vibrating motor control
-            obj.prepareSerialPort;
-                        
+            obj=obj.prepareSerialPort;
+            
             % Prepares Simulink model (i.e. starts recording, basically)
             obj.prepareSimulinkModel;
             
@@ -149,21 +195,15 @@ classdef MI_errP
             obj=createExpFigure(obj);
             
             % Generates array of time triggered events
-            if obj.isTraining
-                obj.timeTriggeredEvents{1}=timeTriggeredEvent('cursorMovementCallback',obj.timingParams.interStepInterval+obj.CDlength);
-            else
-                obj.timeTriggeredEvents{1}=timeTriggeredEvent('cursorMovementCallback',Inf);
-            end
+            obj.timeTriggeredEvents{1}=timeTriggeredEvent('cursorMovementCallback',obj.timingParams.interStepInterval+obj.CDlength);
             obj.timeTriggeredEvents{2}=timeTriggeredEvent('processErrPbuffer',Inf);
-            if obj.isTraining
-                obj.timeTriggeredEvents{3}=timeTriggeredEvent('processMIbuffer',Inf);
-            else
-                obj.timeTriggeredEvents{3}=timeTriggeredEvent('processMIbuffer',0);
-            end
+            obj.timeTriggeredEvents{3}=timeTriggeredEvent('processMIbuffer',0);
             obj.timeTriggeredEvents{4}=timeTriggeredEvent('targetReachedCallback',Inf);
             obj.timeTriggeredEvents{5}=timeTriggeredEvent('estimateMovementDirection',Inf);
-            obj.timeTriggeredEvents{6}=timeTriggeredEvent('switchToMIvibration',Inf);
-            obj.timeTriggeredEvents{7}=timeTriggeredEvent('changeCursorColor',Inf);
+            obj.timeTriggeredEvents{6}=timeTriggeredEvent('switchOffVibration',Inf);
+            obj.timeTriggeredEvents{7}=timeTriggeredEvent('startMI',0);
+            obj.timeTriggeredEvents{8}=timeTriggeredEvent('trainMI',obj.timingParams.phase1Length+obj.CDlength);
+            obj.timeTriggeredEvents{9}=timeTriggeredEvent('trainErrP',obj.timingParams.phase1Length+obj.timingParams.phase2Length+obj.CDlength);
             
             % Shows a countdown
             obj.startCountdown(obj.CDlength);
@@ -176,22 +216,36 @@ classdef MI_errP
         end
         
         function obj=manageExperiment(obj)
+            global motorSerialPort
             % Generate file name used to save experiment data
             fileName=datestr(now,30);
             
-            % If testing session, set first time retrieval of data
-            if ~obj.isTraining
-                obj.timeTriggeredEvents{5}.nextTrigger=obj.currTime+obj.timingParams.MIestimationLength;
-            end
+            % Set pausing variable on base workspace
+            assignin('base','togglePause',0);
             
             % Experiment control loop
-            while ~evalin('base','isExpClosing')&&obj.currTime<=(obj.recLength+obj.CDlength)
+%             while ~evalin('base','isExpClosing')&&length(obj.outputLog.time)<=obj.maxNtrials
+%             try
+            while ~evalin('base','isExpClosing')&&obj.currTime<obj.timingParams.phase1Length+obj.timingParams.phase2Length+obj.timingParams.phase3Length
                 pause(0.001);
                 for currTTevent=1:length(obj.timeTriggeredEvents);
                     obj=checkAndExecute(obj.timeTriggeredEvents{currTTevent},obj.currTime,obj);
                     pause(0.0001);
                 end
+                if (evalin('base','togglePause'))
+                    assignin('base','togglePause',0);
+                    if obj.isPausing
+                        obj.isPausing=0;
+                        set_param(obj.modelName,'SimulationCommand','Continue');
+                    else
+                        obj.isPausing=1;
+                        set_param(obj.modelName,'SimulationCommand','Pause');
+                    end
+                end
             end
+%             catch
+%                 keyboard;
+%             end
             pause(3);
             obj.isExpClosed=1;
             delete(gcf);
@@ -201,16 +255,21 @@ classdef MI_errP
             save(fileName,'obj');
             
             % Stop vibration and close serial port communication
-            global motorSerialPort
-            fprintf(motorSerialPort,'e8\n');
-            pause(0.003)
-            fprintf(motorSerialPort,'r0\n');
-            pause(0.003)
-            fprintf(motorSerialPort,'e4\n');
-            pause(0.003)
-            fprintf(motorSerialPort,'r0\n');
-            fclose(motorSerialPort);
-            delete(motorSerialPort);
+            if obj.isSerialPortOpen
+                fprintf(motorSerialPort,'e8\n');
+                pause(0.003)
+                fprintf(motorSerialPort,'p\n');
+                pause(0.003)
+                fprintf(motorSerialPort,'r0\n');
+                pause(0.003)
+                fprintf(motorSerialPort,'e4\n');
+                pause(0.003)
+                fprintf(motorSerialPort,'p\n');
+                pause(0.003)
+                fprintf(motorSerialPort,'r0\n');
+                fclose(motorSerialPort);
+                delete(motorSerialPort);
+            end
             
             % Clear variables from base workspace
             evalin('base','clear listener*');
@@ -239,7 +298,11 @@ classdef MI_errP
                 obj.figureParams.squareHandles(currSquare)=patch(obj.figureParams.squarePos(currSquare)+obj.figureParams.squareShape.X,obj.figureParams.squareShape.Y,obj.colorScheme.bg);
                 set(obj.figureParams.squareHandles(currSquare),'EdgeColor',obj.colorScheme.edgeColor);
             end
-
+            
+            % Draw arrow, then fix its position
+            obj.figureParams.arrowHandle=patch(obj.figureParams.leftArrow.X+20,obj.figureParams.leftArrow.Y,obj.colorScheme.cursorColor);
+            obj=obj.drawArrow;
+            
             % Set and remove figure axis
             ylim([-1,1]);
             xlim([-1,1]);
@@ -253,6 +316,9 @@ classdef MI_errP
             % Draw cursor
             obj.figureParams.cursorHandle=patch(obj.figureParams.squarePos(obj.cursorPos)+obj.figureParams.squareShape.X,obj.figureParams.squareShape.Y,obj.colorScheme.cursorColor);
             
+            % Draw eye tracking cursor (offscreen)
+            obj.figureParams.ETcursorHandle=patch(obj.figureParams.ETcursor.X+10,obj.figureParams.ETcursor.Y,[.7,.7,.7]);
+            
             % Remove box around figure
             %             undecorateFig;
         end
@@ -261,26 +327,36 @@ classdef MI_errP
             % Log timing
             obj.timeTriggeredEvents{1}.triggersLog=[obj.timeTriggeredEvents{1}.triggersLog,obj.currTime];
             
+            % Hide reached targets text, if present
+            if isfield(obj.figureParams,'targetText')
+                set(obj.figureParams.targetText,'Color',obj.colorScheme.bg);
+            end
+            
             % Test whether planned movement is correct and update
             % corresponding log
             isMovementCorrect=abs(obj.targetPos-obj.nextCursorPos)<abs(obj.targetPos-obj.cursorPos);
             obj.outputLog.correctMovement=cat(1,obj.outputLog.correctMovement,isMovementCorrect);
-
+            
             % Moves cursor to next position
             obj.lastCursorPos=obj.cursorPos;
             obj.cursorPos=obj.nextCursorPos;
             obj.timeTriggeredEvents{7}.nextTrigger=obj.currTime+obj.timingParams.interStepInterval-obj.timingParams.MIestimationLength;
             
-            
             % Start band vibration
             obj.startBandVibration(obj.vibrationParams.feedback,'feedback');
             obj.timeTriggeredEvents{6}.nextTrigger=obj.currTime+obj.timingParams.vibrationLength;
             
+            % Remove arrow (i.e. move it outside of screen)
+            set(obj.figureParams.arrowHandle,'X',get(obj.figureParams.arrowHandle,'X')+20);
+            
             % Test if current target is reached
-            if obj.cursorPos==obj.targetPos
+            %             if obj.cursorPos==obj.targetPos
+            % Test if either extreme position has been reached
+            if ismember(obj.cursorPos,[1,obj.nPositions])
                 obj.timeTriggeredEvents{1}.nextTrigger=Inf;
                 obj.timeTriggeredEvents{7}.nextTrigger=Inf;
                 obj.timeTriggeredEvents{4}.nextTrigger=obj.currTime+obj.timingParams.targetReachedPause;
+                obj.timeTriggeredEvents{2}.nextTrigger=obj.currTime+obj.timingParams.errPestimationLength;
                 set(obj.figureParams.cursorHandle,'XData',get(obj.figureParams.squareHandles(obj.cursorPos),'XData'),'FaceColor',obj.colorScheme.cursorColorReached);
                 return; % Exit early from function
             else
@@ -288,28 +364,29 @@ classdef MI_errP
                 set(obj.figureParams.cursorHandle,'XData',get(obj.figureParams.squareHandles(obj.cursorPos),'XData'),'FaceColor',obj.colorScheme.cursorColorRest);
             end
             
-            if obj.isTraining
+            if obj.currPhase==1
                 % If training session, decide next position
                 obj.nextCursorPos=min(obj.nPositions,max(1,obj.cursorPos+obj.takeStep(obj)));
                 
                 % Set next evaluation time for this function
                 obj.timeTriggeredEvents{1}.nextTrigger=obj.currTime+obj.timingParams.interStepInterval;
             else
-                % If testing session, set events to trigger data retrieval
+                % Set events to trigger data retrieval
                 % and analysis of MI data
-                obj.timeTriggeredEvents{5}.nextTrigger=obj.currTime+obj.timingParams.MIestimationLength;
+                obj.timeTriggeredEvents{5}.nextTrigger=obj.currTime+obj.timingParams.interStepInterval;
                 
                 % Set next evaluation time for this function
                 obj.timeTriggeredEvents{1}.nextTrigger=Inf;
-                
-                % Recover and log errP data
-                obj.timeTriggeredEvents{2}.nextTrigger=obj.currTime+obj.timingParams.errPestimationLength;
             end
+            % Recover and log errP data
+            obj.timeTriggeredEvents{2}.nextTrigger=obj.currTime+obj.timingParams.errPestimationLength;
             
             % Add relevant info to log
             obj.outputLog.cursorPos=cat(1,obj.outputLog.cursorPos,obj.cursorPos);
             obj.outputLog.targetPos=cat(1,obj.outputLog.targetPos,obj.targetPos);
             obj.outputLog.time=cat(1,obj.outputLog.time,obj.currTime);
+            obj.outputLog.correctMov=cat(1,obj.outputLog.correctMov,sign(obj.targetPos-obj.cursorPos));
+            obj.outputLog.actualMov=cat(1,obj.outputLog.actualMov,obj.nextCursorPos-obj.cursorPos);
         end
         
         function obj=processErrPbuffer(obj)
@@ -325,43 +402,67 @@ classdef MI_errP
             % Data buffer is longer than required and not exactly synched
             % with cursor movement. Recover correct section (starting from
             % cursor movement)
-            lastCursorMovTime=obj.outputLog.time(end);
+            lastCursorMovTime=obj.timeTriggeredEvents{1}.triggersLog(end);
             currDelay=dataTimeStamp-lastCursorMovTime;
             dataWindow=dataWindow(round((obj.errPbufferLength-currDelay)*obj.fs+1):round((obj.errPbufferLength-currDelay+obj.timingParams.errPestimationLength)*obj.fs),:);
             
-            % Perform classification
-            lapData=dataWindow*obj.errPclassifier.lapFilterWeights;
-            [freqFeats,timeFeats]=MI_errP.preprocessData(lapData);
-            feats=reshape(cat(2,freqFeats,timeFeats),1,[]);
-            currEst=obj.errPclassifier.clsfr.predict(feats(obj.errPclassifier.featsIdx));
-%             currEst=obj.outputLog.correctMovement(end); % Comment this for actual experiment!!!!
-%             currEst=1;
+            % Recover frequency features
+            freqFeats=evalin('base','BP');
             
-            % Update MI classifier parameters. Apply update on each data
-            % sample that was predicting chosen class
-            if ~currEst % i.e. an error is detected
-                relSamples=obj.outputLog.MIindex{end};
-                relEst=obj.outputLog.MIest(relSamples);
-                majorityEst=median(relEst)>.5;
-                relFeats=obj.outputLog.MIfeats(relSamples,:);
-                updatingSamples=find((obj.outputLog.MIest(relSamples)>.5)==majorityEst);
-                wIn=[obj.MIclassifier.Intercept;obj.MIclassifier.B];
-                for currSample=1:length(updatingSamples)
-                    feats=relFeats(updatingSamples(currSample),:);
-                    E=relEst(updatingSamples(currSample));
-                    t=~majorityEst; % Supposedly, I should be here only if last movement was wrong
-                    wOut=MI_errP.updateWeights(wIn,feats,E,t,obj.learningRate);
-                    obj.MIclassifier.Intercept=wOut(1);
-                    obj.MIclassifier.B=wOut(2:end);
+            % Join freq and time Data
+            feats=cat(1,freqFeats,reshape(resample(dataWindow,64,512),[],1));
+            
+            % Make sure some relevant information is present during
+            % debugging
+            if obj.isDebugging&&~isempty(obj.outputLog.correctMovement)
+                feats(3)=obj.outputLog.correctMovement(end)+sum(feats(1:2));
+            end
+            
+            % If not training, perform classification
+            if obj.currPhase>1
+                if obj.currPhase==3
+                    currEst=obj.errPclassifier.clsfr.predict(feats(obj.errPclassifier.featsIdx)');
+                else
+                    currEst=obj.outputLog.correctMovement(end);
                 end
-                % Logs changing parameters
-                obj.outputLog.MIupdateTime=cat(1,obj.outputLog.MIupdateTime,dataTimeStamp);
-                obj.outputLog.paramsHistory=cat(1,obj.outputLog.paramsHistory,wIn');
+                
+                % Update MI classifier parameters. Apply update on each data
+                % sample that was predicting chosen class
+%                 if ~currEst&&~isempty(obj.outputLog.MIindex) % i.e. an error is detected
+                if ~isempty(obj.outputLog.MIindex)
+                    relSamples=obj.outputLog.MIindex{end};
+                    relEst=obj.outputLog.MIest(relSamples);
+                    majorityEst=median(relEst)>.5;
+                    relFeats=obj.outputLog.MIfeats(relSamples,:);
+                    relProb=obj.MIclassifier.computeProb(relFeats(:,obj.MIclassifier.featsIdx));
+                    updatingSamples=find((obj.outputLog.MIest(relSamples)>.5)==majorityEst);
+                    wIn=[obj.MIclassifier.Intercept;obj.MIclassifier.B];
+%                     t=~majorityEst; % Supposedly, I should be here only if last movement was wrong
+                    t=((majorityEst-.5)*2*(currEst-.5)*2)>0;
+%                     t=(obj.targetPos-obj.cursorPos)>0;
+                    for currSample=1:length(updatingSamples)
+                        updatingFeats=relFeats(updatingSamples(currSample),obj.MIclassifier.featsIdx);
+                        E=relProb(updatingSamples(currSample));
+                        wOut=MI_errP.updateWeights(wIn,updatingFeats,E,t,obj.learningRate);
+                        obj.MIclassifier.Intercept=wOut(1);
+                        obj.MIclassifier.B=wOut(2:end);
+                        computeProb=@(x)1./(1+exp(-(x*wOut(2:end)+wOut(1))));
+                        obj.MIclassifier.computeProb=computeProb;
+                        obj.MIclassifier.predict=@(x)computeProb(x)>.5;
+                    end
+%                     fprintf('%d\n',t);
+                    % Logs changing parameters
+                    obj.outputLog.MIupdateTime=cat(1,obj.outputLog.MIupdateTime,dataTimeStamp);
+                    obj.outputLog.paramsHistory=cat(1,obj.outputLog.paramsHistory,wIn');
+                end
+            else
+                currEst=NaN;
             end
             
             % Log relevant data
             obj.outputLog.errPtimes=cat(1,obj.outputLog.errPtimes,dataTimeStamp);
             obj.outputLog.errPest=cat(1,obj.outputLog.errPest,currEst);
+            obj.outputLog.errPfeats=cat(1,obj.outputLog.errPfeats,feats');
         end
         
         function obj=processMIbuffer(obj)
@@ -371,19 +472,39 @@ classdef MI_errP
             
             % Recover data buffer from base workspace (Simulink puts them
             % there)
-            dataWindow=evalin('base','currMIdata');
+            freqFeats=evalin('base','BP');
             dataTimeStamp=obj.currTime;
             
-            % Perform classification
-            lapData=dataWindow*obj.MIclassifier.lapFilterWeights;
-            freqFeats=reshape(MI_errP.preprocessData(lapData),1,[]);
-            computeProb=@(x)1./(1+exp(-(x*obj.MIclassifier.B+obj.MIclassifier.Intercept)));
-            currProb=computeProb(freqFeats(obj.MIclassifier.featsIdx));
+            % Make sure some relevant information is present during
+            % debugging, then provide drift for coefficients during
+            % training
+            if obj.isDebugging
+                debugCoeffs=[.006;-.0025];
+                freqFeats(3)=freqFeats(1:2)'*debugCoeffs+double(obj.targetPos~=1);
+%                 if obj.currPhase>1
+%                     debugCoeffs=debugCoeffs.*(1+randn(size(debugCoeffs))*.3.*(rand(size(debugCoeffs))>.99));
+%                 end
+            end
+            
+            % If not training, perform classification
+            if obj.currPhase>1
+                currProb=obj.MIclassifier.computeProb(freqFeats(obj.MIclassifier.featsIdx)');
+            else
+                currProb=NaN;
+            end
+            
+            % If MI tactile feedback is occurring, modulate amplitude
+            if ~isempty(obj.timeTriggeredEvents{1}.triggersLog)&&obj.currTime-obj.timeTriggeredEvents{1}.triggersLog(end)>obj.timingParams.interStepInterval-obj.timingParams.MIestimationLength&&obj.currTime-obj.timeTriggeredEvents{1}.triggersLog(end)<obj.timingParams.interStepInterval
+                vibrValue=0.5-(obj.outputLog.MIprob(end));
+                obj.startBandVibration(sign(vibrValue)*sqrt(vibrValue),'MIcontrol');
+            end
             
             % Log relevant data
             obj.outputLog.MItimes=cat(1,obj.outputLog.MItimes,dataTimeStamp);
-            obj.outputLog.MIest=cat(1,obj.outputLog.MIest,currProb);
-            obj.outputLog.MIfeats=cat(1,obj.outputLog.MIfeats,freqFeats(obj.MIclassifier.featsIdx));
+            obj.outputLog.MIest=cat(1,obj.outputLog.MIest,currProb>.5);
+            obj.outputLog.MIprob=cat(1,obj.outputLog.MIprob,currProb);
+            obj.outputLog.MIfeats=cat(1,obj.outputLog.MIfeats,freqFeats');
+            obj.outputLog.MIlbls=cat(1,obj.outputLog.MIlbls,double(obj.targetPos~=1));
         end
         
         function obj=targetReachedCallback(obj)
@@ -394,30 +515,46 @@ classdef MI_errP
             % Add relevant info to log
             obj.outputLog.targetsReached.time=cat(1,obj.outputLog.targetsReached.time,obj.currTime);
             obj.outputLog.targetsReached.targetPos=cat(1,obj.outputLog.targetsReached.targetPos,obj.targetPos);
+            obj.outputLog.targetsReached.correctTarget=cat(1,obj.outputLog.targetsReached.correctTarget,obj.targetPos==obj.cursorPos);
+            
+            % Print number of reached target
+            textString=sprintf('%d',sum(obj.outputLog.targetsReached.targetPos==obj.cursorPos));
+            if ~isfield(obj.figureParams,'targetText')
+                obj.figureParams.targetText=text(mean(get(obj.figureParams.cursorHandle,'XData')),mean(get(obj.figureParams.cursorHandle,'YData'))+.2,textString,'HorizontalAlignment','center');
+            else
+                set(obj.figureParams.targetText,'Position',[mean(get(obj.figureParams.cursorHandle,'XData')),mean(get(obj.figureParams.cursorHandle,'YData'))+.2],'String',textString);
+            end
+            set(obj.figureParams.targetText,'Color','white','FontSize',64);
             
             % Reset cursor pos
             obj.cursorPos=(1+obj.nPositions)/2;
             set(obj.figureParams.cursorHandle,'XData',get(obj.figureParams.squareHandles(obj.cursorPos),'XData'),'FaceColor',obj.colorScheme.cursorColorMI);
             
             % Choose new target position and move it
-            obj.targetPos=1+(randn>0)*(obj.nPositions-1);
+            if obj.isDebugging
+                obj.targetPos=obj.nPositions+1-obj.targetPos;
+            else
+                obj.targetPos=1+(randn>0)*(obj.nPositions-1);
+            end
             set(obj.figureParams.targetHandle,'XData',get(obj.figureParams.squareHandles(obj.targetPos),'XData'));
             
-            if obj.isTraining
+            % Draw arrow
+            obj=obj.drawArrow;
+            
+            if obj.currPhase==1
                 % If training session, decide next position
                 obj.nextCursorPos=min(obj.nPositions,max(1,obj.cursorPos+obj.takeStep(obj)));
                 
                 % Sets vibration cue
                 obj.startBandVibration(obj.vibrationParams.MItrain,'MItraining');
+                
+                % Set next cursor movement time
+                obj.timeTriggeredEvents{1}.nextTrigger=obj.currTime+obj.timingParams.MIestimationLength;
             else
                 % If testing session, set events to trigger data retrieval
                 % and analysis
                 obj.timeTriggeredEvents{5}.nextTrigger=obj.currTime+obj.timingParams.MIestimationLength;
             end
-            
-            % Set next cursor movement time
-            obj.timeTriggeredEvents{1}.nextTrigger=obj.currTime+obj.timingParams.interStepInterval;
-            
             % Add relevant info to log
             obj.outputLog.cursorPos=cat(1,obj.outputLog.cursorPos,obj.cursorPos);
             obj.outputLog.targetPos=cat(1,obj.outputLog.targetPos,obj.targetPos);
@@ -428,77 +565,138 @@ classdef MI_errP
             % Log call timing
             obj.timeTriggeredEvents{5}.triggersLog=[obj.timeTriggeredEvents{5}.triggersLog,obj.currTime];
             
-            % Next position is function of past classification results
-            % (just take median of all available estimates in the window of
-            % interest)
-            if isempty(obj.outputLog.time)
+            if isempty(obj.timeTriggeredEvents{7}.triggersLog)
                 relevantEntries=obj.outputLog.MItimes>obj.CDlength;
             else
-                relevantEntries=obj.outputLog.MItimes>obj.outputLog.time(end);
+%                 relevantEntries=obj.outputLog.MItimes>obj.timeTriggeredEvents{7}.triggersLog(end);
+                relevantEntries=obj.outputLog.MItimes>obj.currTime-obj.timingParams.MIestimationLength;
             end
-            currEst=median(obj.outputLog.MIest(relevantEntries));
             
-            % Verify whether current estimation is statistically
-            % significant, otherwise keep adding data
-            [~,isSignificant]=signrank(obj.outputLog.MIest(relevantEntries)-.5);
+            % Next position is function of past classification results
+            % (just take median of all available estimates in the window of
+            % interest, i.e. since last cursor movement)
+            currEst=nanmedian(obj.outputLog.MIest(relevantEntries));
             
-            if (isSignificant)||(obj.currTime-obj.outputLog.MItimes(find(relevantEntries,1,'first'))>10)
-                suggestedMov=sign(currEst-.5);
-                obj.nextCursorPos=min(obj.nPositions,max(1,obj.cursorPos+suggestedMov));
-                
-                % Log indexes of data used for estimation
-                obj.outputLog.MIindex{end+1}=find(relevantEntries);
-                
-                % Reset trigger time
-                obj.timeTriggeredEvents{5}.nextTrigger=Inf;
-                
-                % Perform suggested step and move on
-                obj.timeTriggeredEvents{1}.nextTrigger=obj.currTime+obj.timingParams.interStepInterval;
-            else
-                % Re evaluate after more data have been collected
-                obj.timeTriggeredEvents{5}.nextTrigger=obj.currTime+obj.timingParams.MIstepLength;
-                obj.timeTriggeredEvents{1}.nextTrigger=Inf;
-            end
+            suggestedMov=sign(currEst-.5);
+            obj.nextCursorPos=min(obj.nPositions,max(1,obj.cursorPos+suggestedMov));
+            
+            % Log indexes of data used for estimation and decision taken
+            obj.outputLog.MIindex{end+1}=find(relevantEntries);
+            obj.outputLog.MItrialMov=cat(1,obj.outputLog.MItrialMov,suggestedMov);
+            
+            % Reset trigger time
+            obj.timeTriggeredEvents{5}.nextTrigger=Inf;
+            
+            % Perform suggested step and move on
+            obj.timeTriggeredEvents{1}.nextTrigger=obj.currTime;
         end
-        
-        function obj=switchToMIvibration(obj)
+               
+        function obj=switchOffVibration(obj)
             % Log timing and reset trigger time
             obj.timeTriggeredEvents{6}.nextTrigger=Inf;
             obj.timeTriggeredEvents{6}.triggersLog=[obj.timeTriggeredEvents{6}.triggersLog,obj.currTime];
             
-            % Send stop command to serial port
-            global motorSerialPort
-            fprintf(motorSerialPort,'r0\n\c');
-            
             % Switch intensity level
-            obj.startBandVibration(obj.vibrationParams.MItrain,'MItraining');
+            obj.startBandVibration(obj.vibrationParams.MItrain,'none');
         end
         
-        function obj=changeCursorColor(obj)
+        function obj=startMI(obj)
             % Log timing and reset trigger time
             obj.timeTriggeredEvents{7}.nextTrigger=Inf;
             obj.timeTriggeredEvents{7}.triggersLog=[obj.timeTriggeredEvents{7}.triggersLog,obj.currTime];
             
-            % Send actual command to serial port
+            % Change cursor color
             set(obj.figureParams.cursorHandle,'FaceColor',obj.colorScheme.cursorColorMI);
+            
+            % Draw arrow
+            obj=drawArrow(obj);
+            
+            % Switch intensity level, if training
+            if obj.currPhase==1
+                obj.startBandVibration(obj.vibrationParams.MItrain,'MItraining');
+            else
+                obj.startBandVibration((obj.outputLog.MIprob(end)-0.5),'MIcontrol');
+            end
+        end
+        
+        function obj=trainMI(obj)
+            % Log timing and reset trigger time
+            obj.timeTriggeredEvents{8}.nextTrigger=Inf;
+            obj.timeTriggeredEvents{8}.triggersLog=[obj.timeTriggeredEvents{8}.triggersLog,obj.currTime];
+            
+            % Train MI classifier, if one is not passed at construction
+            % WARNING: because of massive issue with extreme outliers in
+            % data, classifier will be trained on surrogate dataset
+            if isempty(obj.MIclassifier)
+                obj.MIclassifier=computeMIclassifier(obj);
+            end
+            
+            % If debugging, reset classifier parameters or update will
+            % be useless
+            if obj.isDebugging
+                obj.MIclassifier.B=zeros(size(obj.MIclassifier.B));
+                obj.MIclassifier.Intercept=0;
+%                 obj.MIclassifier.B=(1+0.2*randn(size(obj.MIclassifier.B))).*obj.MIclassifier.B;
+            end
+            
+            % Switch to phase 2
+            obj.currPhase=2;
+        end
+        
+        function obj=trainErrP(obj)
+            % Log timing and reset trigger time
+            obj.timeTriggeredEvents{9}.nextTrigger=Inf;
+            obj.timeTriggeredEvents{9}.triggersLog=[obj.timeTriggeredEvents{9}.triggersLog,obj.currTime];
+            
+            % Train MI classifier
+            obj.errPclassifier=computeErrPclassifier(obj);
+            
+            % If debugging, reset MI classifier parameters or update will
+            % be useless
+            if obj.isDebugging
+                obj.MIclassifier.B=zeros(size(obj.MIclassifier.B));
+                obj.MIclassifier.Intercept=0;
+                %                 obj.MIclassifier.B=(1+0.2*randn(size(obj.MIclassifier.B))).*obj.MIclassifier.B;
+            end
+            
+            % Switch to phase 3
+            obj.currPhase=3;
+        end
+        
+        function obj=drawArrow(obj)
+            if obj.currPhase==1
+                if obj.targetPos==1
+                    set(obj.figureParams.arrowHandle,'X',obj.figureParams.squarePos(obj.cursorPos)+obj.figureParams.leftArrow.X,'Y',obj.figureParams.leftArrow.Y+0.1);
+                else
+                    set(obj.figureParams.arrowHandle,'X',obj.figureParams.squarePos(obj.cursorPos)+obj.figureParams.rightArrow.X,'Y',obj.figureParams.rightArrow.Y+0.1);
+                end
+            else
+                set(obj.figureParams.arrowHandle,'X',obj.figureParams.squarePos(obj.cursorPos)+obj.figureParams.headlessArrow.X,'Y',obj.figureParams.headlessArrow.Y+0.1);
+            end
         end
         
         function obj=selectCondition(obj)
-            clc;
-            for currPossibleCond=1:length(obj.possibleConditions)
-                fprintf('[%d] - %s;\n',currPossibleCond,obj.possibleConditions{currPossibleCond});
+            currCond=0;
+            while true
+                clc;
+                for currPossibleCond=1:length(obj.possibleConditions)
+                    fprintf('[%d] - %s;\n',currPossibleCond,obj.possibleConditions{currPossibleCond});
+                end
+                currCond=input('\nPlease select desired condition: ');
+                if ismember(currCond,1:length(obj.possibleConditions));
+                    break
+                end
             end
-            currCond=input('\nPlease select desired condition: ');
             obj.condition.conditionID=currCond;
         end
         
         function obj=setConditionSpecificParams(obj)
-            % 'Training','testing'
+            % 'V feedback','VT feedback'
             switch obj.condition.conditionID
                 case 1
-                    obj.isTraining=1;
+                    obj.feedbackType=1;
                 case 2
-                    obj.isTraining=0;
+                    obj.feedbackType=2;
             end
         end
         
@@ -526,20 +724,21 @@ classdef MI_errP
             set_param(obj.modelName,'SimulationCommand','Start');
         end
         
-        function prepareSerialPort(obj) %#ok<MANU>
+        function obj=prepareSerialPort(obj)
             global motorSerialPort
             motorSerialPort=serial('COM9','BaudRate',230400,'Parity','even');
             try
                 fopen(motorSerialPort);
                 pause(1);
                 fprintf(motorSerialPort,'e4\n');
-                pause(0.003);
+                pause(0.3);
                 fprintf(motorSerialPort,'p\n');
-                pause(0.003);
+                pause(0.3);
                 fprintf(motorSerialPort,'e8\n');
-                pause(0.003);
+                pause(0.3);
                 fprintf(motorSerialPort,'p\n');
-                pause(0.003);
+                pause(0.3);
+                obj.isSerialPortOpen=1;
             catch
                 warning('Unable to open serial port communication with band motors');
             end
@@ -567,225 +766,103 @@ classdef MI_errP
             delete(textHandle);
         end
         
-        function clsfr=computeErrPclassifier(obj)
+        function [clsfr,cvAcc]=computeErrPclassifier(obj)
             % Recover feats and labels
             [allFeats,lbls]=recoverErrPdata(obj);
                         
-            % Make a first selection of relevant features
-            classLbls=unique(lbls);
-            m=zeros(length(classLbls),size(allFeats,2));
-            md=zeros(size(m));
-            for currClass=1:length(classLbls)
-                % Use median and mad as proxy for mean and sd, to reduce
-                % relevance of artifacts
-                m(currClass,:)=median(allFeats(lbls==classLbls(currClass),:));
-                md(currClass,:)=1.4826*mad(allFeats(lbls==classLbls(currClass),:),1);
-            end
-            computeWorth=@(m1,m2,md1,md2)abs((m1-m2)./sqrt(md1.^2+md2.^2));
-            featWorth=computeWorth(m(1,:),m(2,:),md(1,:),md(2,:));
-            
-            % Keep features with a worth greater than 0.3 (keep at least
-            % 15)
-            [sortedWorth,featOrdr]=sort(featWorth,'descend');
-            goodFeatsNumber=sum(sortedWorth>.2);
-            goodFeatsIdx=featOrdr(1:max(15,goodFeatsNumber));
-            feats=allFeats(:,goodFeatsIdx);
-            
-            % Train classifier
-            fprintf('Training ErrP classifier. Please be patient, it will take some time...\n');
-            clsfr.clsfr=fitcsvm(feats,lbls,'Standardize',true,'KernelScale','auto','KernelFunction','polynomial','PolynomialOrder',2);
-            
-            % Remove features ignored by model
-            clsfr.featsIdx=goodFeatsIdx;
+            % Train classifier and present cross-validation results
+            fprintf('Training ErrP classifier. Please be patient, it will take some time...\n\n');
+            [clsfr,~,cvAcc]=testClassifier2(lbls,allFeats,'blocktype','subsequent','nBlocks',1,'threshold',.3,'selectionType','zScore');
+%             [clsfr,~,cvAcc]=testClassifier2(lbls,allFeats,'blocktype','subsequent','nblocks',10,'threshold',.6,'selectionType','histOverlap');
         end
         
-        function [allFeats,lbls]=recoverErrPdata(obj)
-            % Recover cursor movement times
-            movTimes=obj.outputLog.time;
-            
-            % Compute cursor reset events index and remove them
-            cursorReset=ismember(movTimes,obj.outputLog.targetsReached.time);
-            movTimes(cursorReset)=[];
-            
-            % Recover windows after each movement
-            winStarts=movTimes;
-            winEnds=movTimes+obj.timingParams.errPestimationLength;
-            
-            % Convert to samples
-            winStarts=winStarts*obj.fs;
-            winEnds=winEnds*obj.fs;
-            
-            % Remove last window if longer than recording
-            if winEnds(end)>length(obj.rawData.data)
-                winStarts(end)=[];
-                winEnds(end)=[];
-            end
-            
-            % Recover data
-            rawDataWins=zeros(length(winStarts),obj.timingParams.errPestimationLength*obj.fs,size(obj.rawData.data,2));
-            for currWin=1:length(winStarts)
-                rawDataWins(currWin,:,:)=obj.rawData.data(winStarts(currWin)+1:winEnds(currWin),:);
-            end
-            
-            % Recover time and freq features
-            [freqFeats,timeFeats]=MI_errP.preprocessData(rawDataWins);
-            
-            % Reshape feats
-            allFeats=cat(2,freqFeats,timeFeats);
-            allFeats=reshape(allFeats,size(allFeats,1),[]);
-            
-            % Recover lbls
-            lbls=obj.outputLog.correctMovement;
-            lbls(cursorReset)=[];
-        end
-        
-        function AUC=testErrPclassifier(obj)
+        function cvAcc=testErrPrequiredLength(obj)
             % Recover feats and labels
             [allFeats,lbls]=recoverErrPdata(obj);
             
-            % Define link function and compute estimates
-            computeProb=@(x)1./(1+exp(-(x*obj.errPclassifier.B+obj.errPclassifier.Intercept)));
-            errPest=computeProb(allFeats(:,obj.errPclassifier.featsIdx));
+            % Preserve original data
+            allFeatsBak=allFeats;
+            lblsBak=lbls;
             
-            % Compute AUC
-            [~,~,~,AUC]=perfcurve(lbls,errPest,1);
+            % Test classifier accuracy for different lengths
+            nTrials=25:25:length(lblsBak);
+            cvAcc=zeros(length(nTrials),1);
+            for currLength=1:length(nTrials)
+                allFeats=allFeatsBak(1:nTrials(currLength),:);
+                lbls=lblsBak(1:nTrials(currLength));
+                
+                % Present cross-validation results
+                [~,~,cvAcc(currLength)]=testClassifier2(lbls,allFeats,'blocktype','subsequent','nblocks',6,'threshold',.3);
+%                 [~,~,cvAcc(currLength)]=testClassifier2(lbls,allFeats,'blocktype','subsequent','nblocks',10,'featureN',4,'selectionType','histOverlap');
+                plot(nTrials(1:currLength),cvAcc(1:currLength))
+                pause(0.01);
+                fprintf('%d/%d\n',currLength,length(nTrials));
+            end
+        end
+        
+        function [allFeats,lbls]=recoverErrPdata(obj)
+            lbls=obj.outputLog.correctMovement(1:size(obj.outputLog.errPfeats,1));
+            allFeats=obj.outputLog.errPfeats;
+        end
+        
+        function BACC=testErrPclassifier(obj)
+            % Compute predictions
+            errPest=obj.errPclassifier.clsfr.predict(obj.outputLog.errPfeats(:,obj.errPclassifier.featsIdx));
+            
+            % Compute BACC
+            testAcc=@(x,y)(sum((x==1).*(y==1))./sum(x==1)+sum((x==0).*(y==0))./sum(x==0))*.5;
+            BACC=testAcc(obj.outputLog.correctMovement(1:length(errPest)),errPest>.5);
         end
         
         function clsfr=computeMIclassifier(obj)
             % Recover MI data
             [allFeats,lbls]=recoverMIdata(obj);
-                                                    
-            % Make a first selection of relevant features
-            classLbls=unique(lbls);
-            m=zeros(length(classLbls),size(allFeats,2));
-            md=zeros(size(m));
-            for currClass=1:length(classLbls)
-                % Use median and mad as proxy for mean and sd, to reduce
-                % relevance of artifacts
-                m(currClass,:)=median(allFeats(lbls==classLbls(currClass),:));
-                md(currClass,:)=1.4826*mad(allFeats(lbls==classLbls(currClass),:),1);
-            end
-            computeWorth=@(m1,m2,md1,md2)abs((m1-m2)./sqrt(md1.^2+md2.^2));
-            featWorth=computeWorth(m(1,:),m(2,:),md(1,:),md(2,:));
             
-            % Keep only a very limited number of features (online training
-            % will have issue working correctly, otherwise)
-            [~,featOrdr]=sort(featWorth,'descend');
-            goodFeatsIdx=featOrdr(1:25);
-            feats=allFeats(:,goodFeatsIdx);
+            allFeatsSurr=zeros(size(allFeats));
+            allFeatsSD=zeros(2,size(allFeats,2));
+            allFeatsMean=zeros(2,size(allFeats,2));
+            for currClass=1:2
+                allFeatsSD(currClass,:)=1.4826*mad(allFeats(lbls==currClass-1,:),1);
+                allFeatsMean(currClass,:)=median(allFeats(lbls==currClass-1,:));
+            end
+            for currFeat=1:length(allFeatsMean)
+                for currClass=1:2
+                    relIdx=find(lbls==currClass-1);
+                    allFeatsSurr(relIdx,currFeat)=randn(length(relIdx),1)*allFeatsSD(currClass,currFeat)+allFeatsMean(currClass,currFeat);
+                end
+            end
             
             % Train classifier
             fprintf('Training MI classifier. Please be patient, it will take some time...\n');
-            [B,stats]=lassoglm(feats,lbls==1,'binomial','Alpha',.5,'CV',4);
-            clsfr.B=B(:,stats.Index1SE);
-            clsfr.Intercept=stats.Intercept(stats.Index1SE);
-            
-            % Remove features ignored by model
-            ignoredFeats=B(:,stats.Index1SE)==0;
-            clsfr.B(ignoredFeats)=[];
-            clsfr.featsIdx=goodFeatsIdx;
-            clsfr.featsIdx(ignoredFeats)=[];
+            clsfr=testClassifier2(lbls,allFeatsSurr,'blocktype','subsequent','nblocks',1,'threshold',.1,'selectionType','zScore','classifiertype','logistic');
         end
         
-        function [allFeats,lbls]=recoverMIdata(obj)
-%                         % Recover cursor movement times
-%                         movTimes=obj.outputLog.time;
-            
-%                         % Recover all windows of defined length (MIbufferLength) for
-%                         % which at least half the points lie in the interval of
-%                         % interest (between movement and movement + MIestimationLength)
-%                         sampleTimes=obj.rawData.time;
-%                         distanceFromMovs=ones(length(movTimes),1)*sampleTimes'-movTimes*ones(1,length(sampleTimes));
-%                         winStarts=find(sum((distanceFromMovs>-obj.MIbufferLength*.5+obj.timingParams.errPestimationLength)&(distanceFromMovs<obj.timingParams.MIestimationLength+obj.timingParams.errPestimationLength-obj.MIbufferLength*.5)));
-%                         winEnds=winStarts+obj.timingParams.MIestimationLength*obj.fs;
-%             
-%                         % Subsample considered points: no need to have maximum possible
-%                         % overlap between windows
-%                         % WARNING: this is very significant subsampling. If needs be,
-%                         % more points can be kept (it just makes classifier training
-%                         % slower)
-%                         winStarts=winStarts(1:100:end);
-%                         winEnds=winEnds(1:100:end);
-%             
-%                         % Remove windows that exceed recording length
-%                         toBeRemoved=winEnds>length(obj.rawData.time);
-%                         winStarts(toBeRemoved)=[];
-%                         winEnds(toBeRemoved)=[];
-
-                        % Lap-filter data
-                        lapData=MI_errP.applyLapFilter(obj.rawData.data);
-            
-%                         % Recover windows after each movement
-%                         winStarts=movTimes+obj.timingParams.errPestimationLength;
-%                         winEnds=movTimes+obj.timingParams.errPestimationLength+obj.timingParams.MIestimationLength;
-%             
-%                         % Convert to samples
-%                         winStarts=winStarts*obj.fs;
-%                         winEnds=winEnds*obj.fs;
-%             
-%                         % Recover data
-%                         rawDataWins=zeros(length(winStarts),obj.timingParams.MIestimationLength*obj.fs,size(obj.rawData.data,2));
-%                         for currWin=1:length(winStarts)
-%                             rawDataWins(currWin,:,:)=lapData(winStarts(currWin)+1:winEnds(currWin),:);
-%                         end
-%             
-%                         % Recover lbls
-%                         lbls=double(obj.outputLog.targetPos>1);
-%             
-            % Recover data windows
-            winStarts=round((0:0.25:obj.currTime-obj.MIbufferLength)*obj.fs);
-            winEnds=winStarts+round(obj.MIbufferLength*obj.fs);
-            rawDataWins=zeros(length(winStarts),round(obj.MIbufferLength*obj.fs),size(lapData,2));
-            for currWin=1:length(winStarts)
-                rawDataWins(currWin,:,:)=lapData(winStarts(currWin)+1:winEnds(currWin),:);
+        function [allFeats,lbls,relMIidx]=recoverMIdata(obj)
+            relMIidx=cell(length(obj.outputLog.time),1);
+            for currMov=1:length(obj.outputLog.time)
+                lastMovTime=obj.outputLog.time(currMov);
+                relMIidx{currMov}=find((obj.outputLog.MItimes>lastMovTime-obj.timingParams.MIestimationLength)&(obj.outputLog.MItimes<lastMovTime));
             end
-            
-            % Recover freq features only
-            freqFeats=MI_errP.preprocessData(rawDataWins);
-            
-            % Reshape feats
-            allFeats=reshape(freqFeats,size(freqFeats,1),[]);
-            
-            % Recover only actually relevant windows
-            movTimes=obj.outputLog.time*obj.fs;
-            distanceFromMovs=(ones(length(movTimes),1)*winStarts-movTimes*ones(1,length(winStarts)))/obj.fs;
-            distanceFromMovs(distanceFromMovs<0)=Inf;
-            relevantWindows=(min(distanceFromMovs)>1.2)&(min(distanceFromMovs)<4.8);
-            
-            % Recover lbls
-            lbls=zeros(length(obj.rawData.time),1);
-            lbls(1:obj.outputLog.targetsReached.time(1)*obj.fs)=obj.outputLog.targetsReached.targetPos(1)>1;
-            for currTarget=2:length(obj.outputLog.targetsReached.targetPos)
-                lbls(obj.outputLog.targetsReached.time(currTarget-1)*obj.fs+1:obj.outputLog.targetsReached.time(currTarget)*obj.fs)=obj.outputLog.targetsReached.targetPos(currTarget)>1;
-            end
-            lbls(obj.outputLog.targetsReached.time(end)*obj.fs+1:end)=obj.outputLog.targetPos(end)>1;
-            lbls=lbls(winStarts+round(obj.MIbufferLength*.5*obj.fs));
-            
-            % Remove data and lbls outside of windows of interest
-            lbls=lbls(relevantWindows);
-            allFeats=allFeats(relevantWindows,:);
-
-            % Remove first entries, possibly affected by stabilization of
-            % filters
-            lbls(1:200)=[];
-            allFeats(1:200,:)=[];
+            relMIidxMat=cell2mat(relMIidx);
+            lbls=obj.outputLog.MIlbls(relMIidxMat);
+            allFeats=obj.outputLog.MIfeats(relMIidxMat,:);
         end
         
         function AUC=testMIstaticClassifier(obj)
-%             % Recover feats and labels
-%             [allFeats,lbls]=recoverMIdata(obj);
-%             
-%             % Define link function and compute estimates
-%             computeProb=@(x)1./(1+exp(-(x*obj.MIclassifier.B+obj.MIclassifier.Intercept)));
-%             MIest=computeProb(allFeats(:,obj.MIclassifier.featsIdx));
-%             
-%             % Compute AUC
-%             [~,~,~,AUC]=perfcurve(lbls,MIest,1);
+            %             % Recover feats and labels
+            %             [allFeats,lbls]=recoverMIdata(obj);
+            %
+            %             % Define link function and compute estimates
+            %             computeProb=@(x)1./(1+exp(-(x*obj.MIclassifier.B+obj.MIclassifier.Intercept)));
+            %             MIest=computeProb(allFeats(:,obj.MIclassifier.featsIdx));
+            %
+            %             % Compute AUC
+            %             [~,~,~,AUC]=perfcurve(lbls,MIest,1);
             % Define link function and compute estimates
             computeProb=@(x)1./(1+exp(-(x*obj.MIclassifier.B+obj.MIclassifier.Intercept)));
-            MIestLong=computeProb(obj.outputLog.MIfeats);
+            MIestLong=computeProb(obj.outputLog.MIfeats(:,obj.MIclassifier.featsIdx));
             
-            % Average est for each movement            
+            % Average est for each movement
             MIest=zeros(length(obj.outputLog.MIindex),1);
             for currTrial=1:length(obj.outputLog.MIindex)
                 MIest(currTrial)=mean(MIestLong(obj.outputLog.MIindex{currTrial}));
@@ -808,52 +885,145 @@ classdef MI_errP
         end
         
         function startBandVibration(obj,intensity,vibrationType)
+            global motorSerialPort
+            
             % Intensity will be passed as a parameter between 0 and 1. Need
             % to rescale it as an integer between 0 and 120 for serial port
             % to work properly
-            serialIntensity=round(intensity*120);
-            
-            % Use global variable for motorSerialPort so that it can be
-            % accessed also in case of unexpected program stop
-            global motorSerialPort
-            switch vibrationType
-                case 'feedback' % Vibration position should match last cursor movement
-                    vibrationDir=obj.lastCursorPos-obj.cursorPos;
-                case 'MItraining' % Vibration position should match current direction
-                    vibrationDir=sign(obj.cursorPos-obj.targetPos);
+            if obj.isSerialPortOpen
+                % If tactile feedback is disabled, set intensity to 0
+                serialIntensity=round(intensity*120)*(obj.feedbackType-1);
+                
+                % Use global variable for motorSerialPort so that it can be
+                % accessed also in case of unexpected program stop
+                switch vibrationType
+                    case 'feedback' % Vibration position should match last cursor movement
+                        vibrationDir=obj.lastCursorPos-obj.cursorPos;
+                    case 'MItraining' % Vibration position should match current direction
+                        vibrationDir=sign(obj.cursorPos-obj.targetPos);
+                    case 'none' % Stop vibration, regardless of intensity
+                        vibrationDir=0;
+                    case 'MIcontrol'
+                        vibrationDir=sign(intensity);
+                        serialIntensity=abs(serialIntensity);
+                end
+                switch vibrationDir
+                    case -1
+                        fprintf(motorSerialPort,'e4\n');
+                        pause(0.01);
+                        fprintf(motorSerialPort,'r%d\n',serialIntensity);
+                        pause(0.01);
+                        fprintf(motorSerialPort,'e8\n');
+                        pause(0.01);
+                        fprintf(motorSerialPort,'r0\n');
+                    case 1
+                        fprintf(motorSerialPort,'e8\n');
+                        pause(0.01)
+                        fprintf(motorSerialPort,'r%d\n',serialIntensity);
+                        pause(0.01);
+                        fprintf(motorSerialPort,'e4\n');
+                        pause(0.01);
+                        fprintf(motorSerialPort,'r0\n');
+                    case 0
+                        fprintf(motorSerialPort,'e8\n');
+                        pause(0.01)
+                        fprintf(motorSerialPort,'r0\n');
+                        pause(0.01);
+                        fprintf(motorSerialPort,'e4\n');
+                        pause(0.01);
+                        fprintf(motorSerialPort,'r0\n');
+                end
             end
-            switch vibrationDir
-                case -1
-                    fprintf(motorSerialPort,'e4\n');
-                    pause(0.003);
-                    fprintf(motorSerialPort,'r%d\n',serialIntensity);
-                    pause(0.003);
-                    fprintf(motorSerialPort,'e8\n');
-                    pause(0.003);
-                    fprintf(motorSerialPort,'r0\n');
-                case 1
-                    fprintf(motorSerialPort,'e8\n');
-                    pause(0.003)
-                    fprintf(motorSerialPort,'r%d\n',serialIntensity);
-                    pause(0.003);
-                    fprintf(motorSerialPort,'e4\n');
-                    pause(0.003);
-                    fprintf(motorSerialPort,'r0\n');
-                case 0
-                    fprintf(motorSerialPort,'e8\n');
-                    pause(0.003)
-                    fprintf(motorSerialPort,'r0\n');
-                    pause(0.003);
-                    fprintf(motorSerialPort,'e4\n');
-                    pause(0.003);
-                    fprintf(motorSerialPort,'r0\n');
+        end
+        
+        function plotErrPs(obj)
+            % Normalize data
+            normalize=@(x)(x-repmat(mean(x),size(x,1),1))./repmat(1.4826*mad(x,1),size(x,1),1);
+            normData=normalize(obj.rawData.data);
+            
+            [B,A]=cheby1(4,6,[1,10]/(obj.fs/2));
+            lbls=obj.outputLog.correctMovement;
+            
+            % Apply spatial and freq filters
+            %             lapData=obj.applyLapFilter(obj.rawData.data);
+            carData=MI_errP.applyLapFilter(normData);
+            freqData=filter(B,A,carData);
+            
+            relWins=zeros(length(obj.outputLog.errPtimes),obj.fs*2,size(obj.rawData.data,2));
+            for currWin=1:size(relWins,1)
+                relWins(currWin,:,:)=freqData((obj.outputLog.errPtimes(currWin)-.5)*obj.fs+1:(obj.outputLog.errPtimes(currWin)+1.5)*obj.fs,:);
+            end
+            lbls=lbls(1:length(obj.outputLog.errPtimes));
+            
+            t=linspace(-0.5,1.5,obj.fs*2);
+            load('elMap16_MI_err.mat')
+            for currCh=1:16
+                subplot(4,4,currCh);
+                plot(t,squeeze(median(relWins(lbls==0,:,currCh))),'k');
+                hold on;
+                plot(t,squeeze(median(relWins(lbls==1,:,currCh))),'r');
+                plot(t,squeeze(median(relWins(lbls==0,:,currCh)))-squeeze(median(relWins(lbls==1,:,currCh))),'g','LineWidth',2);
+                axis([-.5,1.5,-.1,.1]);
+                set(gca,'XTickLabel',[],'YTickLabel',[]);
+                xlabel(elMap16.elName{currCh});
+            end
+        end
+        
+        function plotMIspectrograms(obj)
+            % Normalize data
+            normalize=@(x)(x-repmat(mean(x),size(x,1),1))./repmat(1.4826*mad(x,1),size(x,1),1);
+            normData=normalize(obj.rawData.data);
+            
+            [B,A]=cheby1(4,6,[2,60]/(obj.fs/2));
+            
+            % Apply spatial and freq filters
+            lapData=obj.applyLapFilter(normData);
+            freqData=filter(B,A,lapData);
+            
+            % Recover electrode map to name figures and define plot names
+            load('elMap16_MI_err.mat')
+            plotNames={'Left MI','Right MI'};
+            
+            % Compute resulting spectrogram
+            lvl=6;
+%             leftMoves=((obj.outputLog.targetPos==1).*obj.outputLog.correctMovement(1:length(obj.outputLog.targetPos))+((obj.outputLog.targetPos~=1).*~obj.outputLog.correctMovement(1:length(obj.outputLog.targetPos))));
+%             leftMoves=leftMoves(1:end-1); % Remove last entry, as required window might exceed recording length
+%             winStarts=round((obj.timeTriggeredEvents{1}.triggersLog+obj.timingParams.interStepInterval-obj.timingParams.MIestimationLength)*obj.fs);
+%             winStarts=winStarts(1:length(leftMoves));
+            leftMoves=double(obj.outputLog.targetPos==1);
+            winStarts=(obj.timeTriggeredEvents{1}.triggersLog-obj.timingParams.MIestimationLength)*obj.fs;
+            spectMat=zeros(size(freqData,2),length(winStarts),64,obj.timingParams.MIestimationLength*obj.fs);
+            for currCh=1:size(freqData,2);
+                wpt=wpdec(freqData(:,currCh),lvl,'sym6');
+                [S,~,F]=wpspectrum(wpt,obj.fs);
+                
+                % Recover relevant windows, normalize and average them
+                for currWin=1:length(winStarts)
+                    dataWin=S(:,winStarts(currWin)+1:winStarts(currWin)+obj.fs*obj.timingParams.MIestimationLength);
+                    baseLine=mean(dataWin(:,1:obj.fs/2),2);
+                    baseMat=repmat(baseLine,1,obj.timingParams.MIestimationLength*obj.fs);
+                    dataWin=(dataWin-baseMat)./(dataWin+baseMat)*.5;
+                    spectMat(currCh,currWin,:,:)=dataWin;
+                end
+                moveSpect{1}=mean(spectMat(currCh,logical(leftMoves),:,:),2);
+                moveSpect{2}=mean(spectMat(currCh,~logical(leftMoves),:,:),2);
+                figure;
+                set(gcf,'Name',(elMap16.elName{currCh}));
+                for currPlot=1:2
+                    subplot(1,2,currPlot);
+                    imagesc(squeeze(moveSpect{currPlot}),[-.15,.15])
+                    colorbar;
+                    axis([0,obj.fs*obj.timingParams.MIestimationLength,.5,64/256*40]);
+                    title(plotNames{currPlot});
+                    set(gca,'XTick',linspace(0,obj.timingParams.MIestimationLength*obj.fs,6),'XTickLabel',linspace(0,obj.timingParams.MIestimationLength,6),'YDir','normal','YTick',linspace(1,64,32),'YTickLabel',F(round(linspace(1,64,32))))
+                end
             end
         end
         
         function outData=preProcData(obj)
             % Prepare freq filters
             windowLength=.4;
-            nBands=29;
+            nBands=19;
             nChannels=16;
             for currFreq=1:nBands
                 [B(currFreq,:),A(currFreq,:)]=cheby1(2,6,([2*currFreq,2*(currFreq+1)]/obj.fs)/2); %#ok<AGROW>
@@ -893,6 +1063,89 @@ classdef MI_errP
             outData=log10(outData);
         end
         
+        function obj=attachPhase(obj,otherSession)
+            % Some fields may have an extra entry
+            obj.outputLog.time=obj.outputLog.time(1:length(obj.outputLog.errPest));
+            obj.outputLog.cursorPos=obj.outputLog.cursorPos(1:length(obj.outputLog.errPest));
+            obj.outputLog.targetPos=obj.outputLog.targetPos(1:length(obj.outputLog.errPest));
+            obj.outputLog.correctMovement=obj.outputLog.correctMovement(1:length(obj.outputLog.errPest));
+            obj.timeTriggeredEvents{1}.triggersLog=obj.timeTriggeredEvents{1}.triggersLog(1:length(obj.outputLog.errPest));
+            otherSession.outputLog.time=otherSession.outputLog.time(1:length(otherSession.outputLog.errPest));
+            otherSession.outputLog.cursorPos=otherSession.outputLog.cursorPos(1:length(otherSession.outputLog.errPest));
+            otherSession.outputLog.targetPos=otherSession.outputLog.targetPos(1:length(otherSession.outputLog.errPest));
+            otherSession.outputLog.correctMovement=otherSession.outputLog.correctMovement(1:length(otherSession.outputLog.errPest));
+            otherSession.timeTriggeredEvents{1}.triggersLog=otherSession.timeTriggeredEvents{1}.triggersLog(1:length(otherSession.outputLog.errPest));
+            timeStep=median(diff(obj.rawData.time));
+            otherSession.rawData.time=linspace(obj.rawData.time(end)+timeStep,obj.rawData.time(end)+otherSession.rawData.time(end),length(otherSession.rawData.time));
+            joiningFields={'cursorPos','targetPos','errPest','MIest','correctMovement','MIindex','MIfeats','errPfeats'};
+            updatingFields={'time','errPtimes','MItimes','MIupdateTime'};
+            for currUpField=1:length(updatingFields)
+                obj.outputLog.(updatingFields{currUpField})=cat(1,obj.outputLog.(updatingFields{currUpField}),otherSession.outputLog.(updatingFields{currUpField})+obj.rawData.time(end));
+            end
+            obj.outputLog.targetsReached.time=cat(1,obj.outputLog.targetsReached.time,otherSession.outputLog.targetsReached.time+obj.rawData.time(end));
+            for currJoinField=1:length(joiningFields)
+                if size(obj.outputLog.(joiningFields{currJoinField}),2)==size(otherSession.outputLog.(joiningFields{currJoinField}),2)
+                    obj.outputLog.(joiningFields{currJoinField})=cat(1,obj.outputLog.(joiningFields{currJoinField}),otherSession.outputLog.(joiningFields{currJoinField}));
+                else
+                    obj.outputLog.(joiningFields{currJoinField})=cat(2,obj.outputLog.(joiningFields{currJoinField}),otherSession.outputLog.(joiningFields{currJoinField}));
+                end
+            end
+            obj.outputLog.targetsReached.targetPos=cat(1,obj.outputLog.targetsReached.targetPos,otherSession.outputLog.targetsReached.targetPos);
+            obj.outputLog.targetsReached.correctTarget=cat(1,obj.outputLog.targetsReached.correctTarget,otherSession.outputLog.targetsReached.correctTarget);
+            for currTTE=1:length(obj.timeTriggeredEvents)
+                obj.timeTriggeredEvents{currTTE}.triggersLog=cat(2,obj.timeTriggeredEvents{currTTE}.triggersLog,otherSession.timeTriggeredEvents{currTTE}.triggersLog+obj.rawData.time(end));
+            end
+            obj.rawData=append(obj.rawData,otherSession.rawData);
+        end
+        
+        function testAdaptationGain(obj)
+            % Compute estimations with final classifier
+            computeProb=@(x)1./(1+exp(-(x*obj.MIclassifier.B+obj.MIclassifier.Intercept)));
+            MIestEnd=computeProb(obj.outputLog.MIfeats(:,obj.MIclassifier.featsIdx));
+            
+            % Compute estimations with initial classifier
+            obj.MIclassifier.Intercept=obj.outputLog.paramsHistory(1,1);
+            obj.MIclassifier.B=obj.outputLog.paramsHistory(1,2:end)';
+            computeProb=@(x)1./(1+exp(-(x*obj.MIclassifier.B+obj.MIclassifier.Intercept)));
+            MIestStart=computeProb(obj.outputLog.MIfeats(:,obj.MIclassifier.featsIdx));
+            
+            lbls=double(obj.outputLog.targetPos(end-length(obj.outputLog.MIindex)+1:end)==1);
+            lblsEstDyn=zeros(size(lbls));
+            lblsEstEnd=zeros(size(lbls));
+            lblsEstStart=zeros(size(lbls));
+            for currTrial=1:length(lbls)
+                lblsEstDyn(currTrial)=median(obj.outputLog.MIest(obj.outputLog.MIindex{currTrial}))<.5;
+                lblsEstEnd(currTrial)=median(MIestEnd(obj.outputLog.MIindex{currTrial}))<.5;
+                lblsEstStart(currTrial)=median(MIestStart(obj.outputLog.MIindex{currTrial}))<.5;
+            end
+            testAcc=@(x,y)(sum((x==1).*(y==1))./sum(x==1)+sum((x==0).*(y==0))./sum(x==0))*.5;
+            dynBACC=testAcc(lbls,lblsEstDyn);
+            endBACC=testAcc(lbls,lblsEstEnd);
+            startBACC=testAcc(lbls,lblsEstStart);
+            fprintf('Start classifier BAcc: %0.2f\nEnd classifier BAcc: %0.2f\nAdaptive BAcc: %0.2f\n',startBACC,endBACC,dynBACC);
+        end
+        
+        function plotSpectrum(obj)
+            % Around 5000 samples, in current setup, are affected with
+            % startup artifact
+            data=obj.rawData.data(5001:end,:);
+            
+            f=linspace(1/obj.fs,obj.fs,length(data));
+            psd=abs(fft(detrend(data)));
+            loglog(f,medfilt1(max(psd,[],2),7));
+            xlim([f(2),obj.fs/2]);
+        end
+        
+        function BP=trainOfflineMIclassifier(obj)
+            outData=MI_errP.applyLapFilter(obj.rawData.data);
+            winSampleLength=obj.fs*obj.timingParams.MIestimationLength;
+            movIdx=find(ismember(obj.rawData.time,obj.outputLog.time));
+            MIwins=MI_errP.recoverMIwins(outData,movIdx,winSampleLength); %#ok<FNDSB>
+            freqRange=0:2:40;
+            BP=MI_errP.recoverBP(MIwins,freqRange,obj.fs);
+            keyboard;
+        end
+        
         %% Dependent properties
         function cTime=get.currTime(obj)
             if obj.isExpClosed
@@ -924,13 +1177,13 @@ classdef MI_errP
                     timeFeats(currWin,:,currCh)=resample(relData,64,512); % Resample time features at 64Hz (assuming a 512Hz original sampling rate)
                     % Compute log of bandpower
                     freqFeats(currWin,:,currCh)=pyulear(relData.*blackman(length(relData))',16);
-                end                
+                end
             end
             % Consider only frequencies up to ~60Hz
             freqFeats(:,31:end,:)=[];
-%             % Normalize, then extract logs
-%             freqFeats=freqFeats./repmat(sum(freqFeats,3),1,1,size(freqFeats,3));
-%             freqFeats=log(freqFeats);
+            %             % Normalize, then extract logs
+            %             freqFeats=freqFeats./repmat(sum(freqFeats,3),1,1,size(freqFeats,3));
+            %             freqFeats=log(freqFeats);
         end
         
         function [outData,fltrWeights]=applyLapFilter(inData)
@@ -958,7 +1211,7 @@ classdef MI_errP
             % Signals experiment to close
             assignin('base','isExpClosing',1);
         end
-                
+        
         function wOut=updateWeights(wIn,feats,E,t,lr)
             % feats new sample
             % E current classifier prediction
@@ -966,25 +1219,62 @@ classdef MI_errP
             feats=[1,feats];
             wOut=wIn+((lr*(t-E))'*feats)';
         end
+        
+        function objLong=joinSessions(fileNames)
+            load(fileNames{1});
+            objLong=obj;
+            for currFile=2:length(fileNames)
+                load(fileNames{currFile});
+                objLong=attachPhase(objLong,obj);
+            end
+        end
+        
+        function [CARdata,coeff]=CARfilter(inData)
+            CARdata=zeros(size(inData));
+            coeff=zeros(1,size(inData,2));
+            for currCh=1:size(inData,2)
+                otherChsMedian=median(inData(:,[1:currCh-1,currCh+1:end]),2);
+                coeff(currCh)=pinv(otherChsMedian)*inData(:,currCh);
+                CARdata(:,currCh)=inData(:,currCh)-otherChsMedian*coeff(currCh);
+            end
+        end
+        
+        function MIwins=recoverMIwins(rawData,movIdx,winSampleLength)
+            MIwins=zeros(length(movIdx),winSampleLength,size(rawData,2));
+            for currTrial=1:length(movIdx)
+                MIwins(currTrial,:,:)=rawData(movIdx(currTrial)-winSampleLength+1:movIdx(currTrial),:);
+            end
+        end
+        
+        function BP=recoverBP(MIwins,freqRange,fs)
+            BP=zeros(size(MIwins,1),length(freqRange)-1,size(MIwins,3));
+            for currTrial=1:size(BP,1)
+                for currFreq=1:size(BP,2)
+                    for currCh=1:size(BP,3)
+                        BP(currTrial,currFreq,currCh)=bandpower(squeeze(MIwins(currTrial,:,currCh)).*blackman(size(MIwins,2))',fs,freqRange(currFreq:currFreq+1));
+                    end
+                end
+            end
+        end
     end
 end
 
 function simulinkModelStartFcn(modelName) %#ok<DEFNU>
 % Start function for Simulink model.
-blockName=sprintf('%s/triggeredBuffer/MI_buffer',modelName);
-assignin('base','listenerMI',add_exec_event_listener(blockName,'PostOutputs',@acquireMIbufferedData));
-blockName=sprintf('%s/triggeredBuffer/errP_buffer',modelName);
+blockName=sprintf('%s/filterBlock/log',modelName);
+assignin('base','listenerMI',add_exec_event_listener(blockName,'PostOutputs',@acquireFreqFeats));
+blockName=sprintf('%s/filterBlock/errP_buffer',modelName);
 assignin('base','listenerErrP',add_exec_event_listener(blockName,'PostOutputs',@acquireErrPbufferedData));
 end
 
-function acquireMIbufferedData(block,~)
-assignin('base','currMIdata',block.OutputPort(1).Data);
+function acquireFreqFeats(block,~)
+assignin('base','BP',block.OutputPort(1).Data);
 assignin('base','currTime',block.SampleTime);
 end
 
 function acquireErrPbufferedData(block,~)
 assignin('base','currErrPdata',block.OutputPort(1).Data);
-assignin('base','currTime',block.SampleTime);
+assignin('base','currErrPtime',block.SampleTime);
 end
 
 function onMouseMove(~,~)
@@ -1007,6 +1297,9 @@ if strcmp(eventdata.Key,'p')
 end
 if strcmp(eventdata.Key,'t')
     assignin('base','toggleTraining',1);
+end
+if strcmp(eventdata.Key,'z')
+    assignin('base','togglePause',1);
 end
 end
 
