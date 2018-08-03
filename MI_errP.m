@@ -23,7 +23,10 @@ classdef MI_errP
         nPositions=11; % Please, keep this odd
         vibrationParams;
         maxNtrials;
-        takeStep=@(obj)((rand>obj.trainingParams.errChance)-.5)*2*sign(obj.targetPos-obj.cursorPos);
+        takeStep=@(obj)obj.movList(length(obj.outputLog.time)+1)*sign(obj.targetPos-obj.cursorPos);
+        movList=[];
+        targetList=[];
+        nPauses=0;
     end
     properties (Dependent)
         currTime;
@@ -40,7 +43,7 @@ classdef MI_errP
         isPausing=0;
         isSerialPortOpen=0;
         currPhase=1;
-        isDebugging=1;
+        isDebugging=0;
     end
     methods
         %% Constructor
@@ -64,8 +67,11 @@ classdef MI_errP
                 obj.CDlength=15;
             end
             
-%             % Set number of exp trials
-%             obj.maxNtrials=1400;
+            % Load target and movement keys
+            load keys.mat
+            obj.movList=movementKey;
+            obj.targetList=targetKey;
+            obj.maxNtrials=length(movementKey);
             
             % Define timing parameters
             if obj.isDebugging
@@ -75,9 +81,6 @@ classdef MI_errP
                 obj.timingParams.errPestimationLength=.2; % Length of window used for errP estimation, following movement
                 obj.timingParams.vibrationLength=.1; % Length, in seconds, of armband vibration
                 obj.timingParams.interStepInterval=obj.timingParams.MIestimationLength+obj.timingParams.errPestimationLength+.1; % Wait between cursor movements, in seconds
-                obj.timingParams.phase1Length=180; % After this many seconds, MI classifier is computed and perfect online training starts
-                obj.timingParams.phase2Length=600; % After this many seconds from phase 1 beginning, errP classifier is computed and actual online training starts
-                obj.timingParams.phase3Length=600;
             else
                 obj.timingParams.targetReachedPause=2; % Wait at target position, once reached
                 obj.timingParams.MIestimationLength=3; % Integrate data over this many seconds before drawing conclusion
@@ -85,9 +88,6 @@ classdef MI_errP
                 obj.timingParams.errPestimationLength=1; % Length of window used for errP estimation, following movement
                 obj.timingParams.vibrationLength=1; % Length, in seconds, of armband vibration
                 obj.timingParams.interStepInterval=obj.timingParams.MIestimationLength+obj.timingParams.errPestimationLength+1; % Wait between cursor movements, in seconds
-                obj.timingParams.phase1Length=0; % After this many seconds, MI classifier is computed and perfect online training starts
-                obj.timingParams.phase2Length=600; % After this many seconds from phase 1 beginning, errP classifier is computed and actual online training starts
-                obj.timingParams.phase3Length=300;
             end
             
             % Define squares positions
@@ -181,7 +181,7 @@ classdef MI_errP
             
             % Determine starting position for cursor and target, and first
             % movement
-            obj.targetPos=1+(randn>0)*(obj.nPositions-1);
+            obj.targetPos=obj.targetList(1);
             obj.cursorPos=(1+obj.nPositions)/2;
             obj.nextCursorPos=min(obj.nPositions,max(1,obj.cursorPos+obj.takeStep(obj)));
             
@@ -202,8 +202,8 @@ classdef MI_errP
             obj.timeTriggeredEvents{5}=timeTriggeredEvent('estimateMovementDirection',Inf);
             obj.timeTriggeredEvents{6}=timeTriggeredEvent('switchOffVibration',Inf);
             obj.timeTriggeredEvents{7}=timeTriggeredEvent('startMI',0);
-            obj.timeTriggeredEvents{8}=timeTriggeredEvent('trainMI',obj.timingParams.phase1Length+obj.CDlength);
-            obj.timeTriggeredEvents{9}=timeTriggeredEvent('trainErrP',obj.timingParams.phase1Length+obj.timingParams.phase2Length+obj.CDlength);
+%             obj.timeTriggeredEvents{8}=timeTriggeredEvent('trainMI',obj.timingParams.phase1Length+obj.CDlength);
+%             obj.timeTriggeredEvents{9}=timeTriggeredEvent('trainErrP',obj.timingParams.phase1Length+obj.timingParams.phase2Length+obj.CDlength);
             
             % Shows a countdown
             obj.startCountdown(obj.CDlength);
@@ -224,9 +224,9 @@ classdef MI_errP
             assignin('base','togglePause',0);
             
             % Experiment control loop
-%             while ~evalin('base','isExpClosing')&&length(obj.outputLog.time)<=obj.maxNtrials
 %             try
-            while ~evalin('base','isExpClosing')&&obj.currTime<obj.timingParams.phase1Length+obj.timingParams.phase2Length+obj.timingParams.phase3Length
+            while ~evalin('base','isExpClosing')&&length(obj.outputLog.time)<obj.maxNtrials
+%             while ~evalin('base','isExpClosing')&&obj.currTime<obj.timingParams.phase1Length+obj.timingParams.phase2Length+obj.timingParams.phase3Length
                 pause(0.001);
                 for currTTevent=1:length(obj.timeTriggeredEvents);
                     obj=checkAndExecute(obj.timeTriggeredEvents{currTTevent},obj.currTime,obj);
@@ -327,11 +327,6 @@ classdef MI_errP
             % Log timing
             obj.timeTriggeredEvents{1}.triggersLog=[obj.timeTriggeredEvents{1}.triggersLog,obj.currTime];
             
-            % Hide reached targets text, if present
-            if isfield(obj.figureParams,'targetText')
-                set(obj.figureParams.targetText,'Color',obj.colorScheme.bg);
-            end
-            
             % Test whether planned movement is correct and update
             % corresponding log
             isMovementCorrect=abs(obj.targetPos-obj.nextCursorPos)<abs(obj.targetPos-obj.cursorPos);
@@ -358,6 +353,15 @@ classdef MI_errP
                 obj.timeTriggeredEvents{4}.nextTrigger=obj.currTime+obj.timingParams.targetReachedPause;
                 obj.timeTriggeredEvents{2}.nextTrigger=obj.currTime+obj.timingParams.errPestimationLength;
                 set(obj.figureParams.cursorHandle,'XData',get(obj.figureParams.squareHandles(obj.cursorPos),'XData'),'FaceColor',obj.colorScheme.cursorColorReached);
+                
+%                 % Print number of reached target
+%                 textString=sprintf('%d/%d',sum(obj.outputLog.targetsReached.targetPos==obj.cursorPos)+1,sum(obj.targetList==obj.cursorPos));
+%                 if ~isfield(obj.figureParams,'targetText')
+%                     obj.figureParams.targetText=text(mean(get(obj.figureParams.cursorHandle,'XData')),mean(get(obj.figureParams.cursorHandle,'YData'))+.2,textString,'HorizontalAlignment','center');
+%                 else
+%                     set(obj.figureParams.targetText,'Position',[mean(get(obj.figureParams.cursorHandle,'XData')),mean(get(obj.figureParams.cursorHandle,'YData'))+.2],'String',textString);
+%                 end
+%                 set(obj.figureParams.targetText,'Color','white','FontSize',64);
                 return; % Exit early from function
             else
                 % Draw new cursor position
@@ -517,14 +521,17 @@ classdef MI_errP
             obj.outputLog.targetsReached.targetPos=cat(1,obj.outputLog.targetsReached.targetPos,obj.targetPos);
             obj.outputLog.targetsReached.correctTarget=cat(1,obj.outputLog.targetsReached.correctTarget,obj.targetPos==obj.cursorPos);
             
-            % Print number of reached target
-            textString=sprintf('%d',sum(obj.outputLog.targetsReached.targetPos==obj.cursorPos));
-            if ~isfield(obj.figureParams,'targetText')
-                obj.figureParams.targetText=text(mean(get(obj.figureParams.cursorHandle,'XData')),mean(get(obj.figureParams.cursorHandle,'YData'))+.2,textString,'HorizontalAlignment','center');
-            else
-                set(obj.figureParams.targetText,'Position',[mean(get(obj.figureParams.cursorHandle,'XData')),mean(get(obj.figureParams.cursorHandle,'YData'))+.2],'String',textString);
+%             % Hide reached targets text, if present
+%             if isfield(obj.figureParams,'targetText')
+%                 set(obj.figureParams.targetText,'Color',obj.colorScheme.bg);
+%             end
+
+            % Decide if it is time to take a break
+            pauseList=round(length(obj.targetList)/obj.nPauses:length(obj.targetList)/obj.nPauses:length(obj.targetList));
+            if ismember(length(obj.outputLog.targetsReached.time),pauseList)
+                msgH=msgbox('This is a pause. Start again when ready.','Pause','modal');
+                uiwait(msgH);
             end
-            set(obj.figureParams.targetText,'Color','white','FontSize',64);
             
             % Reset cursor pos
             obj.cursorPos=(1+obj.nPositions)/2;
@@ -534,7 +541,7 @@ classdef MI_errP
             if obj.isDebugging
                 obj.targetPos=obj.nPositions+1-obj.targetPos;
             else
-                obj.targetPos=1+(randn>0)*(obj.nPositions-1);
+                obj.targetPos=obj.targetList(length(obj.outputLog.targetsReached.time));
             end
             set(obj.figureParams.targetHandle,'XData',get(obj.figureParams.squareHandles(obj.targetPos),'XData'));
             
@@ -756,11 +763,11 @@ classdef MI_errP
             figure(obj.figureParams.handle)
             for cntDown=nSecs:-1:1
                 if ~exist('textHandle','var')
-                    textHandle=text(-.05,.5,num2str(cntDown));
+                    textHandle=text(0,.5,num2str(cntDown));
                 else
                     set(textHandle,'String',num2str(cntDown));
                 end
-                set(textHandle,'Color','white','FontSize',64);
+                set(textHandle,'Color','white','FontSize',64,'HorizontalAlignment','center');
                 pause(1);
             end
             delete(textHandle);
