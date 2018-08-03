@@ -1,2 +1,2 @@
 # MI_errP
-Working version, used for exp until 2018/02/01
+Code for experiments on simultaneous motor imagery and error potential detection.
